@@ -17,6 +17,9 @@ Database.
   unikit_db.pl case pretty UCD/CaseFolding.txt > case_table.txt
   unikit_db.pl genchar b64 UCD/UnicodeData.txt > genchar.txt
   unikit_db.pl astral pretty UCD/UnicodeData.txt > astral.txt
+  unikit_db.pl core b64 UCD/UnicodeData.txt > core.txt
+  unikit_db.pl bitmap pretty UCD/UnicodeData.txt > bitmap.txt
+  unikit_db.pl remainder pretty UCD/UnicodeData.txt > remainder.txt
 
 =head1 DESCRIPTION
 
@@ -101,29 +104,86 @@ and the second letter in the least significant byte.
 The astral character table is generated with the C<astral> invocation of
 the script.
 
-The astral character table only covers codepoints in range U+20000 to
-U+EFFFF.  The only codepoints greater than U+EFFFF are covered by two
-ranges:  U+F0000 to U+FFFFD and U+100000 to U+10FFFD are both private
-use ranges with general category C<Co>.
+The astral character table covers codepoints in range U+20000 to
+U+10FFFF.  These astral codepoints are not frequently used and mostly
+fall into broad ranges.  A sorted range table is therefore used.
 
-These astral codepoints are not frequently used and mostly fall into
-broad ranges.  Sorted range tables are therefore used.  There are three
-sorted range tables.  The first covers U+20000 to U+2FFFF, the second
-covers U+30000 to U+3FFFF, and the third covers U+E0000 to U+EFFFF.  All
-other codepoints in the astral range are undefined.
+The range table is expressed as an array of unsigned 16-bit integers.
+Each range record is exactly four integer elements:
 
-Range tables are expressed as arrays of unsigned 16-bit integers.  Each
-range record is exactly three integer elements.  The first element is
-the lower bound of a range, the second element is the upper bound of a
-range, and the third element is the two ASCII letters of the general
-category, with the first letter in the most signficant byte and the
-second letter in the least significant byte.
+  1. Plane
+  2. Lower offset
+  3. Upper offset
+  4. Encoded category
 
-Only the 16 least significant bits of the codepoint are stored in the
-records.  The upper bound is included in the range, and must be greater
-than or equal to the lower bound.  For all records after the first in a
-range table, the lower bound must be greater than the upper bound of the
-previous record.
+The plane stores the most significant part of the codepoint range, above
+the 16 least significant bits.  It must be in range 0x0002 to 0x0010.
+
+The lower and upper offsets define a codepoint range within the selected
+plane.  The upper offset is included in the range, and must be greater
+than or equal to the lower offset.  All offsets must be in range 0x0 to
+0xFFFF.
+
+The encoded category has the uppercase ASCII letter code in the most
+significant 8 bits and the lowercase ASCII letter code in the leas
+significant 8 bits.
+
+The range table records are sorted first by ascending plane and then by
+ascending ranges within the planes.
+
+=head2 Core character table
+
+The core character table is generated with the C<core> invocation of the
+script.
+
+The core character table covers codepoints in range U+0000 to U+00FF,
+which are high frequency.  This is a simple lookup table of 256 16-bit
+entries, where each entry has the uppercase ASCII letter of the category
+in the most significant 8 bits and the lowercase ASCII letter of the
+category in the least significant 8 bits.
+
+=head2 Bitmap character table
+
+The bitmap character table is generated with the C<bitmap> invocation of
+the script.
+
+The bitmap character table only covers codepoints in range U+0100 to
+U+1FFFF.  Furthermore, the bitmap character table only covers the
+categories C<Lo>, C<Ll>, and C<So>.  Each bitmap record is a 16-bit
+unsigned integer value where each pair of bits selects the category as
+follows:
+
+  0 - <something else>
+  1 - Lo
+  2 - Ll
+  3 - So
+
+With integers, bit pairs are packed in little-endian order, such that
+the two least significant bits are the first codepoint and the two most
+significant bits are the last codepoint.
+
+Any codepoint covered with the "something else" value can't be
+determined by the bitmap.  The general category table should be
+consulted in these cases, as well as the following fixed ranges:
+
+  U+D800 to U+DFFF - Cs (surrogate)
+  U+E000 to U+F8FF - Co (private use)
+
+=head2 Remainder character table
+
+The remainder character table lists all defined category records that
+are not covered by the general character table, nor the astral character
+table, nor the core character table, nor the bitmap character table.
+
+Specifically, this covers all codepoints in range U+0100 to to U+1FFFF,
+where the category is either C<Cs> or C<Co>.
+
+The remainder character table will merge adjacent records if possible so
+as to minimize the number of remainder records.
+
+This invocation can I<only> be used with C<pretty>.  The table is so
+small it is expected to be hard-coded, so there is no point in base-64
+encoding a data table.
 
 =cut
 
@@ -351,6 +411,216 @@ sub print_array16 {
 # Subprograms
 # ===========
 
+# do_remainder(path_unicodedata)
+# ------------------------------
+#
+# Generate the remainder table, always in pretty-print.
+#
+sub do_remainder {
+  # Get parameters
+  ($#_ == 0) or die "Bad call";
+  
+  my $path_ucdata = shift;
+  (not ref($path_ucdata)) or die "Bad call";
+  (-f $path_ucdata) or die "Failed to find file '$path_ucdata'";
+  
+  # Open general table parser
+  my $parse = GeneralTable->parse($path_ucdata);
+  
+  # Print header
+  print "Remainder table:\n\n";
+  
+  # Record buffer starts undefined
+  my $buf = undef;
+  
+  # Parse records
+  for(my $rec = $parse->readRec; defined $rec; $rec = $parse->readRec) {
+    
+    # Skip any records covered entirely by the core or astral ranges
+    ($rec->{'ubound'} >= 0x100) or next;
+    ($rec->{'lbound'} <= 0x1ffff) or next;
+    
+    # If we got here, make sure record fully outside core and astral
+    # ranges
+    (($rec->{'lbound'} >= 0x100) and
+        ($rec->{'ubound'} <= 0x1ffff)) or
+          die "Record overlaps range boundaries";
+    
+    # The only assigned categories not covered in this range by the
+    # character bitmap and the general character table are Cs and Co, so
+    # we are only interested in Cs and Co records
+    (($rec->{'gencat'} eq 'Cs') or
+      ($rec->{'gencat'} eq 'Co')) or next;
+    
+    # If buffer is defined, either merge current record into the buffer
+    # or flush the buffer and set new record in the buffer; if buffer
+    # not defined, just buffer current record
+    if (defined $buf) {
+      if (($rec->{'gencat'} eq $buf->{'gencat'}) and
+          ($rec->{'lbound'} == $buf->{'ubound'} + 1)) {
+        $buf->{'ubound'} = $rec->{'ubound'};
+      } else {
+        printf "[%s] U+%04X - U+%04X\n",
+          $buf->{'gencat'}, $buf->{'lbound'}, $buf->{'ubound'};
+        $buf = $rec;
+      }
+    } else {
+      $buf = $rec;
+    }
+  }
+  
+  # Flush the buffer
+  if (defined $buf) {
+    printf "[%s] U+%04X - U+%04X\n",
+      $buf->{'gencat'}, $buf->{'lbound'}, $buf->{'ubound'};
+  }
+}
+
+# do_bitmap(path_unicodedata, use_b64)
+# ------------------------------------
+#
+# Generate the character bitmap table.
+#
+sub do_bitmap {
+  # Get parameters
+  ($#_ == 1) or die "Bad call";
+  
+  my $path_ucdata = shift;
+  (not ref($path_ucdata)) or die "Bad call";
+  (-f $path_ucdata) or die "Failed to find file '$path_ucdata'";
+  
+  my $use_b64 = shift;
+  isInteger($use_b64) or die "Bad call";
+  (($use_b64 == 0) or ($use_b64 == 1)) or die "Bad param";
+  
+  # Open general table parser
+  my $parse = GeneralTable->parse($path_ucdata);
+  
+  # Define the bitmap with 16352 16-bit integers, which allows for two
+  # bits per codepoint in range U+0100 to U+1FFFF; everything starts
+  # with all bits clear, which means not covered by the bitmap
+  my @table;
+  for(my $i = 0; $i < 16352; $i++) {
+    push @table, (0);
+  }
+  
+  # Parse records
+  for(my $rec = $parse->readRec; defined $rec; $rec = $parse->readRec) {
+    
+    # If record is outside bitmap range, skip it
+    ($rec->{'ubound'} >= 0x100) or next;
+    ($rec->{'lbound'} <= 0x1ffff) or next;
+    
+    # Make sure record fully in bitmap range
+    (($rec->{'lbound'} >= 0x100) and
+        ($rec->{'ubound'} <= 0x1ffff)) or
+          die "Record overlaps bitmap range boundaries";
+    
+    # Bitmap can only handle Lo, Ll, and So; skip other records
+    (($rec->{'gencat'} eq 'Lo') or
+      ($rec->{'gencat'} eq 'Ll') or
+      ($rec->{'gencat'} eq 'So')) or next;
+    
+    # Assign the right bitmap value
+    my $bmv;
+    if ($rec->{'gencat'} eq 'Lo') {
+      $bmv = 1;
+    } elsif ($rec->{'gencat'} eq 'Ll') {
+      $bmv = 2;
+    } elsif ($rec->{'gencat'} eq 'So') {
+      $bmv = 3;
+    } else {
+      die;
+    }
+    
+    # Assign the value to all codepoints in range
+    for(my $cv = $rec->{'lbound'}; $cv <= $rec->{'ubound'}; $cv++) {
+      # Get the offset in the bitmap and the shift distance
+      my $cpo = $cv - 0x100;
+      my $offs = int($cpo / 8);
+      my $shd = ($cpo % 8) * 2;
+      
+      # Get the bitmap value
+      my $bv = $table[$offs];
+      
+      # Make sure bitmap value is zero currently
+      ((($bv >> $shd) & 0x3) == 0) or
+        die "Duplication bitmap definition";
+      
+      # Add new value to bitmap and store it
+      $bv = $bv | ($bmv << $shd);
+      $table[$offs] = $bv;
+    }
+  }
+  
+  # Print bitmap
+  print "Character bitmap:\n\n";
+  print_array16(\@table, $use_b64);
+}
+
+# do_core(path_unicodedata, use_b64)
+# ----------------------------------
+#
+# Generate the core character table.
+#
+sub do_core {
+  # Get parameters
+  ($#_ == 1) or die "Bad call";
+  
+  my $path_ucdata = shift;
+  (not ref($path_ucdata)) or die "Bad call";
+  (-f $path_ucdata) or die "Failed to find file '$path_ucdata'";
+  
+  my $use_b64 = shift;
+  isInteger($use_b64) or die "Bad call";
+  (($use_b64 == 0) or ($use_b64 == 1)) or die "Bad param";
+  
+  # Open general table parser
+  my $parse = GeneralTable->parse($path_ucdata);
+  
+  # Define lookup table with 256 entries initialized to 0x436E, which is
+  # "Cn" (unassigned)
+  my @table;
+  for(my $i = 0; $i < 256; $i++) {
+    push @table, (0x436E);
+  }
+  
+  # Parse records
+  for(my $rec = $parse->readRec; defined $rec; $rec = $parse->readRec) {
+    
+    # If record is beyond core range, we are done
+    if ($rec->{'lbound'} > 0xFF) {
+      last;
+    }
+    
+    # Records in core range should not be ranges
+    ($rec->{'ubound'} == $rec->{'lbound'}) or
+      die "Range record in core range";
+    
+    # Records in core range should not be unassigned
+    ($rec->{'gencat'} ne 'Cn') or die "Unassigned in core range";
+    
+    # Get category code
+    my $catcode = encode_category($rec->{'gencat'});
+    
+    # Make sure record not yet assigned
+    ($table[$rec->{'ubound'}] == 0x436E) or
+      die "Duplicate core definition";
+    
+    # Update the core record
+    $table[$rec->{'ubound'}] = $catcode;
+  }
+  
+  # Make sure all core records assigned
+  for(my $i = 0; $i < 256; $i++) {
+    ($table[$i] != 0x436E) or die "Unassigned core record";
+  }
+  
+  # Print table
+  print "Core table:\n\n";
+  print_array16(\@table, $use_b64);
+}
+
 # do_astral(path_unicodedata, use_b64)
 # ------------------------------------
 #
@@ -372,9 +642,7 @@ sub do_astral {
   my $parse = GeneralTable->parse($path_ucdata);
   
   # Define range tables
-  my @table_2;
-  my @table_3;
-  my @table_e;
+  my @table;
   
   # Parse records
   for(my $rec = $parse->readRec; defined $rec; $rec = $parse->readRec) {
@@ -382,31 +650,21 @@ sub do_astral {
     # Ignore records with unassigned category
     ($rec->{'gencat'} ne 'Cn') or next;
     
-    # Categorize record by range, skip records outside of range, and
-    # select the proper range table and adjust boundaries to planar
-    # offsets
-    my $table;
+    # Ignore records below astral range
+    ($rec->{'ubound'} >= 0x20000) or next;
     
-    if (($rec->{'lbound'} >= 0x20000) and
-        ($rec->{'ubound'} <= 0x2ffff)) {
-      $table = \@table_2;
-      
-    } elsif (($rec->{'lbound'} >= 0x30000) and
-              ($rec->{'ubound'} <= 0x3ffff)) {
-      $table = \@table_3;
-      
-    } elsif (($rec->{'lbound'} >= 0xe0000) and
-              ($rec->{'ubound'} <= 0xeffff)) {
-      $table = \@table_e;
-      
-    } elsif (($rec->{'lbound'} > 0xeffff) or
-              ($rec->{'ubound'} < 0x20000)) {
-      # Record outside of astral range, so ignore
-      next;
-      
-    } else {
-      die "Record has invalid range";
-    }
+    # If we got here, record intersects with astral range, so make sure
+    # entirely within astral range
+    ($rec->{'lbound'} >= 0x20000) or die "Astral intersection";
+    
+    # Get the planes of the lower and upper bounds
+    my $lbound_plane = $rec->{'lbound'} >> 16;
+    my $ubound_plane = $rec->{'ubound'} >> 16;
+    
+    # Make sure the lower and upper bounds are within the same plane and
+    # then convert boundaries to offsets within that plane
+    ($lbound_plane == $ubound_plane) or die "Astral plane overlap";
+    my $plane = $lbound_plane;
     
     $rec->{'lbound'} &= 0xffff;
     $rec->{'ubound'} &= 0xffff;
@@ -414,9 +672,10 @@ sub do_astral {
     # Get category code
     my $catcode = encode_category($rec->{'gencat'});
     
-    # If selected table is empty, add record range as-is
-    if (scalar(@$table) < 1) {
-      push @$table, ([
+    # If table is empty, add record range as-is
+    if (scalar(@table) < 1) {
+      push @table, ([
+            $plane,
             $rec->{'lbound'},
             $rec->{'ubound'},
             $catcode
@@ -424,57 +683,42 @@ sub do_astral {
       next;
     }
     
-    # If we got here, table is not empty, so check that the lower bound
-    # of this new record is greater than the upper bound of the last
-    # record
-    ($table->[-1]->[1] < $rec->{'lbound'}) or
-      die "Records out of order";
+    # If we got here, table is not empty, so check that ordering of
+    # records is proper
+    ($table[-1]->[0] <= $plane) or die "Records out of order";
+    if ($table[-1]->[0] == $plane) {
+      ($table[-1]->[2] < $rec->{'lbound'}) or
+        die "Records out of order";
+    }
     
     # If we can merge this new record into the last range, do that
-    if (($table->[-1]->[1] == $rec->{'lbound'} - 1) and
-        ($table->[-1]->[2] == $catcode)) {
-      $table->[-1]->[1] = $rec->{'ubound'};
+    if (($table[-1]->[0] == $plane) and
+        ($table[-1]->[2] == $rec->{'lbound'} - 1) and
+        ($table[-1]->[3] == $catcode)) {
+      $table[-1]->[2] = $rec->{'ubound'};
       next;
     }
     
     # If we got here, add record range as-is
-    push @$table, ([
+    push @table, ([
+      $plane,
       $rec->{'lbound'},
       $rec->{'ubound'},
       $catcode
     ]);
   }
   
-  # Print each table
-  for(my $i = 0; $i < 3; $i++) {
-    # Print proper header and get correct table
-    my $table;
-    if ($i == 0) {
-      print "Plane 2 table:\n\n";
-      $table = \@table_2;
-      
-    } elsif ($i == 1) {
-      print "\nPlane 3 table:\n\n";
-      $table = \@table_3;
-      
-    } elsif ($i == 2) {
-      print "\nPlane E table:\n\n";
-      $table = \@table_e;
-      
-    } else {
-      die;
-    }
+  # Print table
+  print "Astral table:\n\n";
     
-    # Flatten the table
-    my @flat;
-    for my $r (@$table) {
-      push @flat, ($r->[0], $r->[1], $r->[2]);
-    }
-    
-    # Print the table
-    print_array16(\@flat, $use_b64);
+  # Flatten the table
+  my @flat;
+  for my $r (@table) {
+    push @flat, ($r->[0], $r->[1], $r->[2], $r->[3]);
   }
   
+  # Print the table
+  print_array16(\@flat, $use_b64);
 }
 
 # do_genchar(path_unicodedata, use_b64)
@@ -794,7 +1038,56 @@ if ($script_mode eq 'case') {
   }
   
   do_astral($path, $style);
+
+} elsif ($script_mode eq 'core') {
+  # Core character table
+  (scalar(@ARGV) == 2) or die "Wrong number of arguments for mode";
+  my $style = shift @ARGV;
+  my $path = shift @ARGV;
   
+  if ($style eq 'pretty') {
+    $style = 0;
+  } elsif ($style eq 'base64') {
+    $style = 1;
+  } else {
+    die "Unrecognized style '$style'";
+  }
+  
+  do_core($path, $style);
+
+} elsif ($script_mode eq 'bitmap') {
+  # Core character table
+  (scalar(@ARGV) == 2) or die "Wrong number of arguments for mode";
+  my $style = shift @ARGV;
+  my $path = shift @ARGV;
+  
+  if ($style eq 'pretty') {
+    $style = 0;
+  } elsif ($style eq 'base64') {
+    $style = 1;
+  } else {
+    die "Unrecognized style '$style'";
+  }
+  
+  do_bitmap($path, $style);
+
+} elsif ($script_mode eq 'remainder') {
+  # Core character table
+  (scalar(@ARGV) == 2) or die "Wrong number of arguments for mode";
+  my $style = shift @ARGV;
+  my $path = shift @ARGV;
+  
+  if ($style eq 'pretty') {
+    $style = 0;
+  } elsif ($style eq 'base64') {
+    $style = 1;
+  } else {
+    die "Unrecognized style '$style'";
+  }
+  
+  ($style == 0) or die "base64 not supported in remainder mode";
+  do_remainder($path);
+
 } else {
   die "Unknown script mode '$script_mode'";
 }
