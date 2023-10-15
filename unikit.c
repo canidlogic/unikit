@@ -64,11 +64,15 @@ static void raiseErr(int lnum, const char *pDetail) {
 static int m_init = 0;
 
 /*
- * The case folding indices and data table.
+ * The case folding indices and data table, along with their lengths.
  */
 static uint16_t *m_case_lower = NULL;
 static uint16_t *m_case_upper = NULL;
 static uint16_t *m_case_data  = NULL;
+
+static int32_t m_case_lower_len = 0;
+static int32_t m_case_upper_len = 0;
+static int32_t m_case_data_len = 0;
 
 /*
  * Local functions
@@ -76,9 +80,10 @@ static uint16_t *m_case_data  = NULL;
  */
 
 /* Prototypes */
-static uint16_t *decodeUint16Array(const char *pStr);
+static uint16_t *decodeUint16Array(const char *pStr, int32_t *pLen);
 static uint16_t queryTrie(
     const uint16_t *pTrie,
+          int32_t   tlen,
           uint32_t  key,
           int       depth);
 
@@ -94,15 +99,20 @@ static uint16_t queryTrie(
  * multiple of two so that it can be assembled into unsigned 16-bit
  * integers.
  * 
+ * The pLen variable will receive the length -- in integers, not
+ * bytes -- of the returned array.
+ * 
  * Parameters:
  * 
  *   pStr - the base-64 string to decode
+ * 
+ *   pLen - variable to receive number of elements in the decoded array
  * 
  * Return:
  * 
  *   a dynamically-allocated array decoded from the base-64 string
  */
-static uint16_t *decodeUint16Array(const char *pStr) {
+static uint16_t *decodeUint16Array(const char *pStr, int32_t *pLen) {
   
   int32_t slen = 0;
   int32_t i = 0;
@@ -166,10 +176,11 @@ static uint16_t *decodeUint16Array(const char *pStr) {
     raiseErr(__LINE__, NULL);
   }
   
+  /* Compute total number of elements */
+  *pLen = (int32_t) ((groups * 3) + extra);
+  
   /* Allocate a buffer of the correct length */
-  pBuf = (uint16_t *) calloc(
-                        (size_t) ((groups * 3) + extra),
-                        sizeof(uint16_t));
+  pBuf = (uint16_t *) calloc((size_t) *pLen, sizeof(uint16_t));
   if (pBuf == NULL) {
     raiseErr(__LINE__, "Out of memory");
   }
@@ -262,7 +273,9 @@ static uint16_t *decodeUint16Array(const char *pStr) {
  * Query a compiled trie.
  * 
  * pTrie is a pointer to the compiled trie, and depth is the depth of
- * the tree, which must be in range 1 to 8.
+ * the tree, which must be in range 1 to 8.  tlen is the length in
+ * integers (not bytes!) of the compiled trie, which is used as a
+ * safeguard against out-of-bounds memory access.
  * 
  * The compiled tree is a sequence of tables, where each table is
  * exactly 16 unsigned 16-bit integers.  Each table is either a leaf
@@ -293,6 +306,8 @@ static uint16_t *decodeUint16Array(const char *pStr) {
  * 
  *   pTrie - the compiled trie
  * 
+ *   tlen - the length in elements of the compiled trie
+ * 
  *   key - the encoded key nybble sequence
  * 
  *   depth - the depth of the trie
@@ -303,6 +318,7 @@ static uint16_t *decodeUint16Array(const char *pStr) {
  */
 static uint16_t queryTrie(
     const uint16_t *pTrie,
+          int32_t   tlen,
           uint32_t  key,
           int       depth) {
   
@@ -313,6 +329,9 @@ static uint16_t queryTrie(
   
   /* Check parameters */
   if (pTrie == NULL) {
+    raiseErr(__LINE__, NULL);
+  }
+  if (tlen < 1) {
     raiseErr(__LINE__, NULL);
   }
   if ((depth < 1) || (depth > 8)) {
@@ -329,6 +348,10 @@ static uint16_t queryTrie(
     j = (int) ((key >> ((depth - i - 1) * 4)) & 0x0f);
     
     /* Get the indexed record and handle missing record */
+    if (tptr + j >= tlen) {
+      raiseErr(__LINE__, "Trie bound error");
+    }
+    
     r = pTrie[tptr + j];
     if (r == 0xffff) {
       tptr = -1;
@@ -343,6 +366,11 @@ static uint16_t queryTrie(
    * the least significant nybble; else, result is 0xffff */
   if (tptr >= 0) {
     j = (int) (key & 0x0f);
+    
+    if (tptr + j >= tlen) {
+      raiseErr(__LINE__, "Trie bound error");
+    }
+    
     r = pTrie[tptr + j];
     
   } else {
@@ -375,11 +403,14 @@ void unikit_init(unikit_fp_err fpErr) {
   
   /* Decode tables */
   m_case_lower = decodeUint16Array(
-                  unikit_data_fetch(UNIKIT_DATA_KEY_CASE_LOWER));
+                  unikit_data_fetch(UNIKIT_DATA_KEY_CASE_LOWER),
+                  &m_case_lower_len);
   m_case_upper = decodeUint16Array(
-                  unikit_data_fetch(UNIKIT_DATA_KEY_CASE_UPPER));
+                  unikit_data_fetch(UNIKIT_DATA_KEY_CASE_UPPER),
+                  &m_case_upper_len);
   m_case_data  = decodeUint16Array(
-                  unikit_data_fetch(UNIKIT_DATA_KEY_CASE_DATA));
+                  unikit_data_fetch(UNIKIT_DATA_KEY_CASE_DATA),
+                  &m_case_data_len);
 }
 
 /*
@@ -437,10 +468,12 @@ int unikit_fold(UNIKIT_FOLD *pf, int32_t cv) {
    * significant bits of the codepoint; if in another plane, just set a
    * failed query result */
   if (plane == 0) {
-    r = queryTrie(m_case_lower, (uint32_t) (cv & 0xffff), 4);
+    r = queryTrie(m_case_lower, m_case_lower_len,
+                    (uint32_t) (cv & 0xffff), 4);
     
   } else if (plane == 1) {
-    r = queryTrie(m_case_upper, (uint32_t) (cv & 0xffff), 4);
+    r = queryTrie(m_case_upper, m_case_upper_len,
+                    (uint32_t) (cv & 0xffff), 4);
     
   } else {
     r = 0xffff;
@@ -452,6 +485,11 @@ int unikit_fold(UNIKIT_FOLD *pf, int32_t cv) {
     /* Extract fields from the data key */
     sqlen = ((int) (r & 0x3)) + 1;
     base = (int) (r >> 2);
+    
+    /* Check that range is within data array bounds */
+    if (base > m_case_data_len - ((int32_t) sqlen)) {
+      raiseErr(__LINE__, "Data bound error");
+    }
     
     /* Copy the codepoint array, increasing codepoint values by 0x10000
      * if they are in the upper plane */
