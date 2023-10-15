@@ -4,6 +4,7 @@ use warnings;
 
 use Scalar::Util qw(looks_like_number);
 
+use GeneralTable;
 use Trie;
 
 =head1 NAME
@@ -356,7 +357,124 @@ sub print_array16 {
 # Generate the astral character table.
 #
 sub do_astral {
-  # @@TODO:
+  # Get parameters
+  ($#_ == 1) or die "Bad call";
+  
+  my $path_ucdata = shift;
+  (not ref($path_ucdata)) or die "Bad call";
+  (-f $path_ucdata) or die "Failed to find file '$path_ucdata'";
+  
+  my $use_b64 = shift;
+  isInteger($use_b64) or die "Bad call";
+  (($use_b64 == 0) or ($use_b64 == 1)) or die "Bad param";
+  
+  # Open general table parser
+  my $parse = GeneralTable->parse($path_ucdata);
+  
+  # Define range tables
+  my @table_2;
+  my @table_3;
+  my @table_e;
+  
+  # Parse records
+  for(my $rec = $parse->readRec; defined $rec; $rec = $parse->readRec) {
+    
+    # Ignore records with unassigned category
+    ($rec->{'gencat'} ne 'Cn') or next;
+    
+    # Categorize record by range, skip records outside of range, and
+    # select the proper range table and adjust boundaries to planar
+    # offsets
+    my $table;
+    
+    if (($rec->{'lbound'} >= 0x20000) and
+        ($rec->{'ubound'} <= 0x2ffff)) {
+      $table = \@table_2;
+      
+    } elsif (($rec->{'lbound'} >= 0x30000) and
+              ($rec->{'ubound'} <= 0x3ffff)) {
+      $table = \@table_3;
+      
+    } elsif (($rec->{'lbound'} >= 0xe0000) and
+              ($rec->{'ubound'} <= 0xeffff)) {
+      $table = \@table_e;
+      
+    } elsif (($rec->{'lbound'} > 0xeffff) or
+              ($rec->{'ubound'} < 0x20000)) {
+      # Record outside of astral range, so ignore
+      next;
+      
+    } else {
+      die "Record has invalid range";
+    }
+    
+    $rec->{'lbound'} &= 0xffff;
+    $rec->{'ubound'} &= 0xffff;
+    
+    # Get category code
+    my $catcode = encode_category($rec->{'gencat'});
+    
+    # If selected table is empty, add record range as-is
+    if (scalar(@$table) < 1) {
+      push @$table, ([
+            $rec->{'lbound'},
+            $rec->{'ubound'},
+            $catcode
+      ]);
+      next;
+    }
+    
+    # If we got here, table is not empty, so check that the lower bound
+    # of this new record is greater than the upper bound of the last
+    # record
+    ($table->[-1]->[1] < $rec->{'lbound'}) or
+      die "Records out of order";
+    
+    # If we can merge this new record into the last range, do that
+    if (($table->[-1]->[1] == $rec->{'lbound'} - 1) and
+        ($table->[-1]->[2] == $catcode)) {
+      $table->[-1]->[1] = $rec->{'ubound'};
+      next;
+    }
+    
+    # If we got here, add record range as-is
+    push @$table, ([
+      $rec->{'lbound'},
+      $rec->{'ubound'},
+      $catcode
+    ]);
+  }
+  
+  # Print each table
+  for(my $i = 0; $i < 3; $i++) {
+    # Print proper header and get correct table
+    my $table;
+    if ($i == 0) {
+      print "Plane 2 table:\n\n";
+      $table = \@table_2;
+      
+    } elsif ($i == 1) {
+      print "\nPlane 3 table:\n\n";
+      $table = \@table_3;
+      
+    } elsif ($i == 2) {
+      print "\nPlane E table:\n\n";
+      $table = \@table_e;
+      
+    } else {
+      die;
+    }
+    
+    # Flatten the table
+    my @flat;
+    for my $r (@$table) {
+      push @flat, ($r->[0], $r->[1], $r->[2]);
+    }
+    
+    # Print the table
+    print_array16(\@flat, $use_b64);
+  }
+  
 }
 
 # do_genchar(path_unicodedata, use_b64)
@@ -377,9 +495,8 @@ sub do_genchar {
   isInteger($use_b64) or die "Bad call";
   (($use_b64 == 0) or ($use_b64 == 1)) or die "Bad param";
   
-  # Open the data file in raw byte mode
-  open(my $fh, "< :raw", $path_ucdata) or
-    die "Failed to open file '$path_ucdata'";
+  # Open general table parser
+  my $parse = GeneralTable->parse($path_ucdata);
   
   # Define tries for upper and lower ranges, each with a nybble depth of
   # four
@@ -387,52 +504,25 @@ sub do_genchar {
   my $table_lower = Trie->create(4);
   
   # Parse records
-  for(
-      my $ltext = readline($fh);
-      defined $ltext;
-      $ltext = readline($fh)) {
-    
-    # Drop line break, comments, and trim whitespace
-    chomp $ltext;
-    $ltext =~ s/#.*//;
-    $ltext =~ s/^\s+//;
-    $ltext =~ s/\s+$//;
-    
-    # Skip if blank
-    (length($ltext) > 0) or next;
-    
-    # Split record into fields
-    ($ltext =~ /^([^;]*);([^;]*);([^;]*);/) or die "Invalid record";
-    my $ucode = $1;
-    my $uname = $2;
-    my $ugc   = $3;
-    
-    # Parse codepoint field
-    ($ucode =~ /^\s*([0-9A-Fa-f]{1,6})\s*$/) or
-      die "Invalid codepoint field";
-    
-    $ucode = hex($1);
-    (($ucode >= 0) and ($ucode <= 0x10FFFF)) or
-      die "Codepoint out of range";
+  for(my $rec = $parse->readRec; defined $rec; $rec = $parse->readRec) {
     
     # Skip codepoints that are not in range U+0100 to U+20000
-    (($ucode >= 0x100) and ($ucode <= 0x20000)) or next;
-    
-    # Parse category field
-    ($ugc =~ /^\s*([A-Z][a-z])\s*$/) or die "Invalid category";
-    $ugc = $1;
+    ($rec->{'ubound'} >= 0x100) or next;
+    ($rec->{'lbound'} < 0x20000) or next;
     
     # Skip categories that are excluded from this table
+    my $ugc = $rec->{'gencat'};
     (($ugc ne 'Lo') and ($ugc ne 'Ll') and
       ($ugc ne 'So') and ($ugc ne 'Cs') and
       ($ugc ne 'Co') and ($ugc ne 'Cn')) or next;
     
-    # If we got here, the name field shouldn't start with the <
-    # character indicating a special range or control
-    (not ($uname =~ /^\s*</)) or die "Invalid name";
+    # If we got here, the record shouldn't be a range, and get the
+    # unique codepoint
+    ($rec->{'lbound'} == $rec->{'ubound'}) or die "Unexpected range";
+    my $ucode = $rec->{'lbound'};
     
     # Convert category into 16-bit integer value
-    my $ckey = encode_category($ugc);
+    my $ckey = encode_category($rec->{'gencat'});
   
     # Choose the proper subtable and adjust codepoint
     my $table;
@@ -469,9 +559,6 @@ sub do_genchar {
   
   print "\nUpper index:\n\n";
   print_array16(\@index_upper, $use_b64);
-  
-  # Close the data file
-  close($fh) or warn "Failed to close file";
 }
 
 # do_case(path_casefold, use_b64)
@@ -691,6 +778,22 @@ if ($script_mode eq 'case') {
   }
   
   do_genchar($path, $style);
+
+} elsif ($script_mode eq 'astral') {
+  # Astral character table
+  (scalar(@ARGV) == 2) or die "Wrong number of arguments for mode";
+  my $style = shift @ARGV;
+  my $path = shift @ARGV;
+  
+  if ($style eq 'pretty') {
+    $style = 0;
+  } elsif ($style eq 'base64') {
+    $style = 1;
+  } else {
+    die "Unrecognized style '$style'";
+  }
+  
+  do_astral($path, $style);
   
 } else {
   die "Unknown script mode '$script_mode'";
