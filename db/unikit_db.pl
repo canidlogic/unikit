@@ -2,6 +2,10 @@
 use v5.16;
 use warnings;
 
+use Scalar::Util qw(looks_like_number);
+
+use Trie;
+
 =head1 NAME
 
 unikit_db.pl - Generate Unikit data tables from the Unicode Character
@@ -9,15 +13,21 @@ Database.
 
 =head1 SYNOPSIS
 
-  unikit_db.pl case UCD/CaseFolding.txt > case_table.txt
+  unikit_db.pl case pretty UCD/CaseFolding.txt > case_table.txt
+  unikit_db.pl genchar b64 UCD/UnicodeData.txt > genchar.txt
+  unikit_db.pl astral pretty UCD/UnicodeData.txt > astral.txt
 
 =head1 DESCRIPTION
 
 The first parameter to this script selects the kind of Unikit data table
-that should be generated.  Following this initial parameter come one or
-more paths to specific data files in the Unicode Character Database
-which will be parsed.  The generated result is written to standard
-output.
+that should be generated.  The second parameter to this script is either
+C<pretty> or C<base64> to select whether output should be in a readable
+format or in a base-64 C string literal format.
+
+Following these initial parameters come one or more paths to specific
+data files in the Unicode Character Database which will be parsed.  The
+generated result is written to standard output.  This script is written
+against version 15.1 of the Unicode Character Database.
 
 The following subsections document the kind of data tables that can be
 generated and their format.
@@ -27,77 +37,471 @@ generated and their format.
 The case folding table is generated with the C<case> invocation of the
 script.
 
-The case folding table is split into two separate tables, both of which
-have the exact same format.  One table is used for codepoints in range
-U+0000 to U+FFFF, while the other table is used for codepoints in range
-U+10000 to U+1FFFF.
+The case folding table consists of two compiled tries of depth 4 and a
+data array.  See the Trie module for the details of how a compiled Trie
+works.
 
-(There are no case folding records beyond U+1FFFF.  Furthermore, all
-case folding records in U+0000 to U+FFFF only map to other codepoints in
-that same range, and all case folding records in U+10000 to U+1FFFF only
-map to other codepoints in that same range.  The two ranges can
-therefore be handled separately.)
+The first trie covers codepoints U+0000 to U+FFFF, while the second trie
+covers codepoints U+10000 to U+1FFFF.  There are no case folding records
+for codepoints greater than U+1FFFF.  The key to use in each trie is the
+four nybbles of the lower 16 bits of the codepoint.
 
-Each table is expressed as an index of exactly 256 unsigned 8-bit
-integers, followed by a variable-length array of unsigned 16-bit
-integers.
+The mapped value in both tries is a data key into the data array.  The
+two least significant bits are one less than the number of codepoints in
+the case folding expansion.  When the data key is shifted right by two
+bits, it yields the integer offset within the data array that the
+expansion codepoint sequence begins at.
 
-The most significant 8 bits of the 16 least significant bits of the
-codepoint are used as an offset into the index table.  If the index
-table record is 255, then the table contains no case foldings for
-codepoints in that range.  Otherwise, the index of the table record
-selects a subtable in range 0 to 254.
+All codepoints in the data array are stored with only their 16 least
+significant bits.  The 17th bit should be set to the same value as the
+17th bit of the input codepoint.  That is, codepoints in range U+0000 to
+U+FFFF map exclusively to other codepoints in that range, and codepoints
+in range U+10000 to U+1FFFF map exclusively to other codepoints in that
+range.
 
-Subtables are stored within the 16-bit array.  Each subtable has exactly
-256 records, and each record contains exactly three 16-bit integers.
-Therefore, each subtable consists of 768 16-bit integers.  Subtable
-index N starts at the integer offset 768 times N within the 16-bit
-array.
+=head2 General character table
 
-The least significant 8 bits of the codepoints are used as a record
-index within the subtable.  If the first integer of the record is zero,
-then there is no case folding for that codepoint.  If the first integer
-is non-zero and the second is zero, then the case-folding is to a single
-codepoint given in the first integer.  If the first two integers are
-non-zero and the third is zero, then the case-folding is to a sequence
-of two codepoints given in the first two integers.  If all three
-integers are non-zero, then the case-folding is to a sequence of three
-codepoints.
+The general character table is generated with the C<genchar> invocation
+of the script.
+
+The general character table only covers codepoints in range U+0100 to
+U+1FFFF.  Codepoints in range U+0000 to U+00FF are high frequency and
+handled with a special lookup table.  Codepoints U+20000 and above
+consist of broad ranges of similar codepoints that are not handled well
+with a trie.
+
+The general character table covers all general categories except for the
+following:
+
+  Lo Ll So Cs Co Cn
+
+The C<Lo>, C<Ll>, and C<So> categories are large categories that are
+better handled with a bitmap that assigns two bits to each codepoints to
+select between those three categories and a fourth value indicating not
+covered by the bitmap.
+
+The C<Cs> and C<Co> categories are represented by broad ranges that are
+easy to do range tests for.
+
+The C<Cn> category is assigned to anything that is in Unicode range but
+not in any of the tables.
+
+The general character table is represented by two tries of depth 4.  The
+first trie has keys representing codepoints in range U+0000 to U+FFFF,
+while the second trie has keys representing codepoints in range U+10000
+to U+1FFFF.
+
+The 16-bit values that these tries map to are the two ASCII letters of
+the general category, with the first letter in the most significant byte
+and the second letter in the least significant byte.
+
+=head2 Astral character table
+
+The astral character table is generated with the C<astral> invocation of
+the script.
+
+The astral character table only covers codepoints in range U+20000 to
+U+EFFFF.  The only codepoints greater than U+EFFFF are covered by two
+ranges:  U+F0000 to U+FFFFD and U+100000 to U+10FFFD are both private
+use ranges with general category C<Co>.
+
+These astral codepoints are not frequently used and mostly fall into
+broad ranges.  Sorted range tables are therefore used.  There are three
+sorted range tables.  The first covers U+20000 to U+2FFFF, the second
+covers U+30000 to U+3FFFF, and the third covers U+E0000 to U+EFFFF.  All
+other codepoints in the astral range are undefined.
+
+Range tables are expressed as arrays of unsigned 16-bit integers.  Each
+range record is exactly three integer elements.  The first element is
+the lower bound of a range, the second element is the upper bound of a
+range, and the third element is the two ASCII letters of the general
+category, with the first letter in the most signficant byte and the
+second letter in the least significant byte.
+
+Only the 16 least significant bits of the codepoint are stored in the
+records.  The upper bound is included in the range, and must be greater
+than or equal to the lower bound.  For all records after the first in a
+range table, the lower bound must be greater than the upper bound of the
+previous record.
 
 =cut
+
+# ===============
+# Local functions
+# ===============
+
+# isInteger(val)
+# --------------
+#
+# Check that the given value is an integer.  Return 1 if an integer or 0
+# if not.
+#
+sub isInteger {
+  ($#_ == 0) or die "Bad call";
+  my $val = shift;
+  
+  looks_like_number($val) or return 0;
+  (int($val) == $val) or return 0;
+  
+  return 1;
+}
+
+# base64_table()
+# --------------
+#
+# Return an array of 64 strings in list context.  Each string is exactly
+# one character long, corresponding to one of the base-64 digits.
+#
+sub base64_table {
+  ($#_ < 0) or die "Bad call";
+  
+  my @result;
+  
+  for(my $i = 0; $i < 26; $i++) {
+    push @result, (chr(ord('A') + $i));
+  }
+  
+  for(my $i = 0; $i < 26; $i++) {
+    push @result, (chr(ord('a') + $i));
+  }
+  
+  for(my $i = 0; $i < 10; $i++) {
+    push @result, (chr(ord('0') + $i));
+  }
+  
+  push @result, ('+');
+  push @result, ('/');
+  
+  return @result;
+}
+
+# encode_category(cc)
+# -------------------
+#
+# Given a category code consisting of an uppercase ASCII letter followed
+# by a lowercase ASCII letter, return an integer in range 0x0000 to
+# 0xFFFF that has the uppercase ASCII letter in the 8 most significant
+# bits and the lowercase ASCII letter in the 8 least significant bits.
+#
+sub encode_category {
+  ($#_ == 0) or die "Bad call";
+  
+  my $cc = shift;
+  (not ref($cc)) or die "Bad call";
+  
+  ($cc =~ /^([A-Z])([a-z])$/) or die "Category out of range";
+  my $upper = ord($1);
+  my $lower = ord($2);
+  
+  return (($upper << 8) | $lower);
+}
+
+# print_array16(\@ar, $use_b64)
+# -----------------------------
+#
+# Print an array of unsigned 16-bit integers.
+#
+# ar is the array reference.  It must have at least one element and at
+# most 65536 elements.  Each element must be a scalar integer that is in
+# range 0x0000 to 0xFFFF.
+#
+# use_b64 is an integer that is either 0 (false) or 1 (true).  If false,
+# then the array is printed in pretty format.  If true, then the array
+# is printed in base64 C literal format.
+#
+# Pretty format begins each line with four base-16 characters indicating
+# the integer offset of the first integer in the line.  There are up to
+# eight integers on each line.
+#
+# Base64 format has a double-quoted C string literal on each line.  Each
+# line's literal contains up to 64 base-64 characters.  16-bit integers
+# are encoded in big endian format.
+#
+sub print_array16 {
+  # Get parameters
+  ($#_ == 1) or die "Bad call";
+  
+  my $ar = shift;
+  (ref($ar) eq 'ARRAY') or die "Bad parameter type";
+  ((scalar(@$ar) > 0) and (scalar(@$ar) <= 65536)) or
+    die "Array length out of range";
+  
+  my $use_b64 = shift;
+  isInteger($use_b64) or die "Bad parameter type";
+  (($use_b64 == 0) or ($use_b64 == 1)) or die "Parameter out of range";
+  
+  # Print requested format
+  if ($use_b64) {
+    # Base-64 C literal format, so each line will encode up to 24 16-bit
+    # integers, which will result in up to 64 base-64 digits per line
+    my @encode_table = base64_table();
+    for(my $base = 0; $base < scalar(@$ar); $base += 24) {
+      # Print line header
+      print "  \"";
+      
+      # Decode the integers on this line into an array of bytes
+      my @bytes;
+      for(
+          my $i = $base;
+          ($i < $base + 24) and ($i < scalar(@$ar));
+          $i++) {
+        my $ival = $ar->[$i];
+        push @bytes, (
+          ($ival >> 8) & 0xff,
+           $ival       & 0xff
+        );
+      }
+      
+      # Determine how many full triplets of bytes there are, and how
+      # many bytes remain at the end that are not in triplets
+      my $triplets = int(scalar(@bytes) / 3);
+      my $rem = scalar(@bytes) % 3;
+      
+      # Encode each full triplet into four base-64 digits
+      for(my $i = 0; $i < $triplets * 3; $i += 3) {
+        my @comp = (
+          ($bytes[$i] >> 2),
+          (($bytes[$i] & 0x3) << 4) | ($bytes[$i + 1] >> 4),
+          (($bytes[$i + 1] & 0x0f) << 2) | ($bytes[$i + 2] >> 6),
+          ($bytes[$i + 2] & 0x3f)
+        );
+        
+        printf "%s%s%s%s",
+          $encode_table[$comp[0]],
+          $encode_table[$comp[1]],
+          $encode_table[$comp[2]],
+          $encode_table[$comp[3]];
+      }
+      
+      # Handle remaining bytes cases
+      if ($rem == 2) {
+        # Two bytes remain, so we will have three base-16 digits
+        my @comp = (
+          ($bytes[-2] >> 2),
+          (($bytes[-2] & 0x3) << 4) | ($bytes[-1] >> 4),
+          (($bytes[-1] & 0x0f) << 2)
+        );
+        
+        # Print the three base-16 digits with an equals sign for padding
+        printf "%s%s%s=",
+          $encode_table[$comp[0]],
+          $encode_table[$comp[1]],
+          $encode_table[$comp[2]];
+        
+      } elsif ($rem == 1) {
+        # One byte remains, so we will have two base-16 digits
+        my @comp = (
+          ($bytes[-1] >> 2),
+          (($bytes[-1] & 0x3) << 4)
+        );
+        
+        # Print the two base-16 digits with two equals signs for padding
+        printf "%s%s==",
+          $encode_table[$comp[0]],
+          $encode_table[$comp[1]];
+        
+      } else {
+        # The only other possibility is zero remainder, in which case we
+        # need not do anything
+        ($rem == 0) or die;
+      }
+      
+      # Print line trailer
+      print "\"\n";
+    }
+    
+  } else {
+    # Pretty format, so print each integer individually
+    for(my $i = 0; $i < scalar(@$ar); $i++) {
+      # If not first element, print comma to close previous element
+      if ($i > 0) {
+        print ",";
+      }
+      
+      # If element index is multiple of eight but not zero, then print
+      # line break
+      if ((($i % 8) == 0) and ($i > 0)) {
+        print "\n";
+      }
+      
+      # If element index is multiple of eight, including zero, then
+      # print line header; else, print space separator
+      if (($i % 8) == 0) {
+        printf "%04x: ", $i;
+      } else {
+        print " ";
+      }
+      
+      # Get current element and check
+      my $e = $ar->[$i];
+      isInteger($e) or die "Wrong element type";
+      (($e >= 0) and ($e <= 0xFFFF)) or die "Element out of range";
+      
+      # Print current element
+      printf "0x%04x", $e;
+    }
+    
+    # Print final line break
+    print "\n";
+  }
+}
 
 # ===========
 # Subprograms
 # ===========
 
-# do_case(path_casefold)
-# ----------------------
+# do_astral(path_unicodedata, use_b64)
+# ------------------------------------
+#
+# Generate the astral character table.
+#
+sub do_astral {
+  # @@TODO:
+}
+
+# do_genchar(path_unicodedata, use_b64)
+# -------------------------------------
+#
+# Generate the general character table.  See the module documentation
+# for exclusions that are not covered in the general character table.
+#
+sub do_genchar {
+  # Get parameters
+  ($#_ == 1) or die "Bad call";
+  
+  my $path_ucdata = shift;
+  (not ref($path_ucdata)) or die "Bad call";
+  (-f $path_ucdata) or die "Failed to find file '$path_ucdata'";
+  
+  my $use_b64 = shift;
+  isInteger($use_b64) or die "Bad call";
+  (($use_b64 == 0) or ($use_b64 == 1)) or die "Bad param";
+  
+  # Open the data file in raw byte mode
+  open(my $fh, "< :raw", $path_ucdata) or
+    die "Failed to open file '$path_ucdata'";
+  
+  # Define tries for upper and lower ranges, each with a nybble depth of
+  # four
+  my $table_upper = Trie->create(4);
+  my $table_lower = Trie->create(4);
+  
+  # Parse records
+  for(
+      my $ltext = readline($fh);
+      defined $ltext;
+      $ltext = readline($fh)) {
+    
+    # Drop line break, comments, and trim whitespace
+    chomp $ltext;
+    $ltext =~ s/#.*//;
+    $ltext =~ s/^\s+//;
+    $ltext =~ s/\s+$//;
+    
+    # Skip if blank
+    (length($ltext) > 0) or next;
+    
+    # Split record into fields
+    ($ltext =~ /^([^;]*);([^;]*);([^;]*);/) or die "Invalid record";
+    my $ucode = $1;
+    my $uname = $2;
+    my $ugc   = $3;
+    
+    # Parse codepoint field
+    ($ucode =~ /^\s*([0-9A-Fa-f]{1,6})\s*$/) or
+      die "Invalid codepoint field";
+    
+    $ucode = hex($1);
+    (($ucode >= 0) and ($ucode <= 0x10FFFF)) or
+      die "Codepoint out of range";
+    
+    # Skip codepoints that are not in range U+0100 to U+20000
+    (($ucode >= 0x100) and ($ucode <= 0x20000)) or next;
+    
+    # Parse category field
+    ($ugc =~ /^\s*([A-Z][a-z])\s*$/) or die "Invalid category";
+    $ugc = $1;
+    
+    # Skip categories that are excluded from this table
+    (($ugc ne 'Lo') and ($ugc ne 'Ll') and
+      ($ugc ne 'So') and ($ugc ne 'Cs') and
+      ($ugc ne 'Co') and ($ugc ne 'Cn')) or next;
+    
+    # If we got here, the name field shouldn't start with the <
+    # character indicating a special range or control
+    (not ($uname =~ /^\s*</)) or die "Invalid name";
+    
+    # Convert category into 16-bit integer value
+    my $ckey = encode_category($ugc);
+  
+    # Choose the proper subtable and adjust codepoint
+    my $table;
+    if (($ucode >= 0x0000) and ($ucode <= 0xffff)) {
+      $table = $table_lower;
+      
+    } elsif (($ucode >= 0x10000) and ($ucode < 0x1FFFF)) {
+      $table = $table_upper;
+      $ucode -= 0x10000;
+      
+    } else {
+      die;
+    }
+    
+    # Split adjusted codepoint into nybble key
+    my @mk = (
+      $ucode >> 12,
+      ($ucode >> 8) & 0x0f,
+      ($ucode >> 4) & 0x0f,
+      $ucode & 0x0f
+    );
+    
+    # Add to table
+    $table->add(\@mk, $ckey);
+  }
+  
+  # Compile the two tries
+  my @index_upper = $table_upper->compile;
+  my @index_lower = $table_lower->compile;
+  
+  # Print the tries and the data table
+  print "Lower index:\n\n";
+  print_array16(\@index_lower, $use_b64);
+  
+  print "\nUpper index:\n\n";
+  print_array16(\@index_upper, $use_b64);
+  
+  # Close the data file
+  close($fh) or warn "Failed to close file";
+}
+
+# do_case(path_casefold, use_b64)
+# -------------------------------
 #
 # Generate the case-folding table.
 #
 sub do_case {
   # Get parameters
-  ($#_ == 0) or die "Bad call";
+  ($#_ == 1) or die "Bad call";
   
   my $path_casefold = shift;
   (not ref($path_casefold)) or die "Bad call";
   (-f $path_casefold) or die "Failed to find file '$path_casefold'";
   
+  my $use_b64 = shift;
+  isInteger($use_b64) or die "Bad call";
+  (($use_b64 == 0) or ($use_b64 == 1)) or die "Bad param";
+  
   # Open the data file in raw byte mode
   open(my $fh, "< :raw", $path_casefold) or
     die "Failed to open file '$path_casefold'";
   
-  # Case folding tables have 256 records initially all set to undef;
-  # when subtables are defined as array references, each has 256 records
-  # initially all set to undef; when records defined in those subtables,
-  # they are subarrays with one to three codepoint records
-  my @fold_upper;
-  my @fold_lower;
+  # Define tries for upper and lower ranges, each with a nybble depth of
+  # four
+  my $fold_upper = Trie->create(4);
+  my $fold_lower = Trie->create(4);
   
-  for(my $i = 0; $i < 256; $i++) {
-    push @fold_upper, (undef);
-    push @fold_lower, (undef);
-  }
+  # Define data table which holds codepoint sequences
+  my @data;
   
   # Parse records
   for(
@@ -186,203 +590,60 @@ sub do_case {
       die;
     }
     
-    # Get the correct table reference
+    # Make sure codepoint array has length in range 1 to 4
+    ((scalar(@cpa) >= 1) and (scalar(@cpa) <= 4)) or
+      die "Codepoint array length out of range";
+    
+    # Get the data offset of this sequence and make sure in range 0 to
+    # 0x3FFE
+    my $data_offs = scalar(@data);
+    (($data_offs >= 0) and ($data_offs <= 0x3FFE)) or
+      die "Too many codepoint sequences";
+    
+    # Shift the data offset over by two and use the two lower bits to
+    # store one less than the codepoint array length to get the data key
+    my $data_key = ($data_offs << 2) | (scalar(@cpa) - 1);
+
+    # Append sequence to data
+    push @data, (@cpa);
+
+    # Get the correct trie reference
     my $fold;
     if ($tchoice == 1) {
-      $fold = \@fold_upper;
+      $fold = $fold_upper;
     
     } elsif ($tchoice == 0) {
-      $fold = \@fold_lower;
+      $fold = $fold_lower;
       
     } else {
       die;
     }
     
-    # Parse ucode into an index and an address
-    my $idx  = ($ucode >> 8) & 0xff;
-    my $addr =  $ucode       & 0xff;
-    
-    # Define subtable if not yet defined
-    unless (defined $fold->[$idx]) {
-      $fold->[$idx] = [];
-      for(my $i = 0; $i < 256; $i++) {
-        push @{$fold->[$idx]}, (undef);
-      }
-    }
-    
-    # Check record not yet defined
-    (not defined $fold->[$idx]->[$addr]) or
-      die "Duplicate codepoint record";
+    # Parse ucode into a key of four nybbles
+    my @ukey = (
+      ($ucode >> 12) & 0x0f,
+      ($ucode >>  8) & 0x0f,
+      ($ucode >>  4) & 0x0f,
+       $ucode        & 0x0f
+    );
     
     # Add the new record
-    $fold->[$idx]->[$addr] = \@cpa;
+    $fold->add(\@ukey, $data_key);
   }
   
-  # Define the index tables and data tables
-  my @index_upper;
-  my @index_lower;
+  # Compile the two tries
+  my @index_upper = $fold_upper->compile;
+  my @index_lower = $fold_lower->compile;
   
-  my @data_upper;
-  my @data_lower;
+  # Print the tries and the data table
+  print "Lower index:\n\n";
+  print_array16(\@index_lower, $use_b64);
   
-  for(my $i = 0; $i < 2; $i++) {
-    # Get the current index, data, and folding table
-    my $fold;
-    my $index;
-    my $data;
-    
-    if ($i == 0) {
-      $fold = \@fold_upper;
-      $index = \@index_upper;
-      $data = \@data_upper;
-      
-    } elsif ($i == 1) {
-      $fold = \@fold_lower;
-      $index = \@index_lower;
-      $data = \@data_lower;
-      
-    } else {
-      die;
-    }
-    
-    # The subtable count starts at zero
-    my $count = 0;
-    
-    # Define each index record
-    for(my $j = 0; $j < 256; $j++) {
-      # If this subtable not defined, add a 255 entry and skip it
-      unless (defined $fold->[$j]) {
-        push @$index, (255);
-        next;
-      }
-      
-      # We need another subtable, so check we haven't reached the limit
-      ($count < 255) or die "Too many subtables";
-      
-      # Use the current count as the index entry and then increment
-      # count
-      push @$index, ($count);
-      $count++;
-    }
-    
-    # Initialize the data table with all records at zero
-    my $rec_count = $count * 256;
-    for(my $k = 0; $k < $rec_count; $k++) {
-      push @$data, (0, 0, 0);
-    }
-    
-    # Copy all records from the folding table into the data table
-    for(my $m = 0; $m < 256; $m++) {
-      # Skip this index record if undefined
-      (defined $fold->[$m]) or next;
-      
-      # Get the subtable index
-      my $subtable = $index->[$m];
-      ($subtable < 255) or die;
-      $subtable *= 768;
-      
-      # Define all subtable records
-      for(my $n = 0; $n < 256; $n++) {
-        # Skip this record if undefined
-        (defined $fold->[$m]->[$n]) or next;
-        
-        # Get record and compute offset in data table
-        my $rec = $fold->[$m]->[$n];
-        my $offs = ($n * 3) + $subtable;
-        
-        # Copy subtable record
-        for my $r (@$rec) {
-          $data->[$offs] = $r;
-          $offs++;
-        }
-      }
-    }
-  }
+  print "\nUpper index:\n\n";
+  print_array16(\@index_upper, $use_b64);
   
-  # Print macro declarations
-  print "#define B(X) UINT8_C(X)\n";
-  print "#define W(X) UINT16_C(X)\n";
-  print "\n";
-  
-  # Print index tables
-  for(my $i = 0; $i < 2; $i++) {
-    # Print header and get index table
-    my $idx;
-    if ($i == 0) {
-      $idx = \@index_lower;
-      print "static uint8_t FOLD_INDEX_LOWER[256] = {";
-      
-    } elsif ($i == 1) {
-      $idx = \@index_upper;
-      print "static uint8_t FOLD_INDEX_UPPER[256] = {";
-      
-    } else {
-      die;
-    }
-    
-    # Print records in rows of 8 entries
-    for(my $j = 0; $j < 256; $j++) {
-      # If this is not the first record, add a comma as a separator from
-      # the previous
-      unless ($j < 1) {
-        print ",";
-      }
-      
-      # If this record is zero or a multiple of 8, line break and  
-      # indent, else space
-      if (($j % 8) == 0) {
-        print "\n  ";
-      } else {
-        print " ";
-      }
-      
-      # Print this record
-      printf "B(%3d)", $idx->[$j];
-    }
-    
-    # Print footer
-    print "\n};\n\n";
-  }
-  
-  # Print data tables
-  for(my $i = 0; $i < 2; $i++) {
-    # Print header and get data table
-    my $data;
-    if ($i == 0) {
-      $data = \@data_lower;
-      printf "static uint16_t FOLD_DATA_LOWER[%d] = {", scalar(@$data);
-      
-    } elsif ($i == 1) {
-      $data = \@data_upper;
-      printf "static uint16_t FOLD_DATA_UPPER[%d] = {", scalar(@$data);
-      
-    } else {
-      die;
-    }
-    
-    # Print records in rows of 6 entries
-    for(my $j = 0; $j < scalar(@$data); $j++) {
-      # If this is not the first record, add a comma as a separator from
-      # the previous
-      unless ($j < 1) {
-        print ",";
-      }
-      
-      # If this record is zero or a multiple of 6, line break and  
-      # indent, else space
-      if (($j % 6) == 0) {
-        print "\n  ";
-      } else {
-        print " ";
-      }
-      
-      # Print this record
-      printf "W(0x%04x)", $data->[$j];
-    }
-    
-    # Print footer
-    print "\n};\n\n";
-  }
+  print "\nData table:\n\n";
+  print_array16(\@data, $use_b64);
   
   # Close the data file
   close($fh) or warn "Failed to close file";
@@ -401,10 +662,35 @@ my $script_mode = shift @ARGV;
 #
 if ($script_mode eq 'case') {
   # Case folding mode
-  (scalar(@ARGV) == 1) or die "Wrong number of arguments for mode";
+  (scalar(@ARGV) == 2) or die "Wrong number of arguments for mode";
+  my $style = shift @ARGV;
   my $path = shift @ARGV;
   
-  do_case($path);
+  if ($style eq 'pretty') {
+    $style = 0;
+  } elsif ($style eq 'base64') {
+    $style = 1;
+  } else {
+    die "Unrecognized style '$style'";
+  }
+  
+  do_case($path, $style);
+  
+} elsif ($script_mode eq 'genchar') {
+  # General category table
+  (scalar(@ARGV) == 2) or die "Wrong number of arguments for mode";
+  my $style = shift @ARGV;
+  my $path = shift @ARGV;
+  
+  if ($style eq 'pretty') {
+    $style = 0;
+  } elsif ($style eq 'base64') {
+    $style = 1;
+  } else {
+    die "Unrecognized style '$style'";
+  }
+  
+  do_genchar($path, $style);
   
 } else {
   die "Unknown script mode '$script_mode'";
