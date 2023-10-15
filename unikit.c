@@ -75,6 +75,21 @@ static int32_t m_case_upper_len = 0;
 static int32_t m_case_data_len = 0;
 
 /*
+ * The general category tables, along with their lengths.
+ */
+static uint16_t *m_gcat_core = NULL;
+static uint16_t *m_gcat_gen_low = NULL;
+static uint16_t *m_gcat_gen_high = NULL;
+static uint16_t *m_gcat_bitmap = NULL;
+static uint16_t *m_gcat_astral = NULL;
+
+static int32_t m_gcat_core_len = 0;
+static int32_t m_gcat_gen_low_len = 0;
+static int32_t m_gcat_gen_high_len = 0;
+static int32_t m_gcat_bitmap_len = 0;
+static int32_t m_gcat_astral_len = 0;
+
+/*
  * Local functions
  * ===============
  */
@@ -244,6 +259,13 @@ static uint16_t *decodeUint16Array(const char *pStr, int32_t *pLen) {
     iv64 = (iv64 << 6) | ((int64_t) c);
   }
   
+  /* Byte-align decoded partial value */
+  if (extra == 1) {
+    iv64 >>= 2;
+  } else if (extra == 2) {
+    iv64 >>= 4;
+  }
+  
   /* Store any extra decoded integers */
   if (extra == 1) {
     pb[0] = (uint16_t) (iv64 & 0xffff);
@@ -411,6 +433,22 @@ void unikit_init(unikit_fp_err fpErr) {
   m_case_data  = decodeUint16Array(
                   unikit_data_fetch(UNIKIT_DATA_KEY_CASE_DATA),
                   &m_case_data_len);
+  
+  m_gcat_core     = decodeUint16Array(
+                      unikit_data_fetch(UNIKIT_DATA_KEY_GCAT_CORE),
+                      &m_gcat_core_len);
+  m_gcat_gen_low  = decodeUint16Array(
+                      unikit_data_fetch(UNIKIT_DATA_KEY_GCAT_GEN_LOW),
+                      &m_gcat_gen_low_len);
+  m_gcat_gen_high = decodeUint16Array(
+                      unikit_data_fetch(UNIKIT_DATA_KEY_GCAT_GEN_HIGH),
+                      &m_gcat_gen_high_len);
+  m_gcat_bitmap   = decodeUint16Array(
+                      unikit_data_fetch(UNIKIT_DATA_KEY_GCAT_BITMAP),
+                      &m_gcat_bitmap_len);
+  m_gcat_astral   = decodeUint16Array(
+                      unikit_data_fetch(UNIKIT_DATA_KEY_GCAT_ASTRAL),
+                      &m_gcat_astral_len);
 }
 
 /*
@@ -441,6 +479,11 @@ int unikit_fold(UNIKIT_FOLD *pf, int32_t cv) {
   int sqlen = 0;
   int base = 0;
   int i = 0;
+  
+  /* Check state */
+  if (!m_init) {
+    raiseErr(__LINE__, "Unikit not initialized");
+  }
   
   /* Check parameters */
   if (pf == NULL) {
@@ -521,5 +564,184 @@ int unikit_fold(UNIKIT_FOLD *pf, int32_t cv) {
   }
   
   /* Return trivial indicator */
+  return result;
+}
+
+/*
+ * unikit_category function.
+ */
+uint16_t unikit_category(int32_t cv) {
+  
+  uint16_t result = 0;
+  int32_t lbound = 0;
+  int32_t ubound = 0;
+  int32_t mid = 0;
+  
+  int cr = 0;
+  int plane = 0;
+  int32_t offs = 0;
+  uint16_t r_plane = 0;
+  uint16_t r_lower = 0;
+  uint16_t r_upper = 0;
+  
+  /* Check state */
+  if (!m_init) {
+    raiseErr(__LINE__, "Unikit not initialized");
+  }
+  
+  /* Default result if we don't find anything is Cn */
+  result = UNIKIT_GCAT_Cn;
+  
+  /* Handling depends on range */
+  if ((cv >= 0) && (cv <= 0xff)) {
+    /* In core range, so use the core lookup */
+    if (m_gcat_core_len != 256) {
+      raiseErr(__LINE__, "Invalid core table length");
+    }
+    result = m_gcat_core[cv];
+    
+  } else if ((cv >= 0x100) && (cv <= 0x1ffff)) {
+    /* In general range, so first we want to compute the offset and
+     * shift value for this codepoint within the character bitmap */
+    offs  = cv - 0x100;
+    plane = (int) ((offs % 8) * 2);
+    offs  = offs / 8;
+    
+    /* Get the bitmap value for this codepoint */
+    if (offs >= m_gcat_bitmap_len) {
+      raiseErr(__LINE__, "Bitmap query out of range");
+    }
+    result = (uint16_t) ((m_gcat_bitmap[offs] >> plane) & 0x3);
+    
+    /* Decode the bitmap value */
+    if (result == 1) {
+      result = UNIKIT_GCAT_Lo;
+      
+    } else if (result == 2) {
+      result = UNIKIT_GCAT_Ll;
+      
+    } else if (result == 3) {
+      result = UNIKIT_GCAT_So;
+      
+    } else if (result == 0) {
+      /* Bitmap didn't answer our question, so our next attempt is to
+       * query the general character table tries */
+      if (cv <= 0xffff) {
+        result = queryTrie(m_gcat_gen_low, m_gcat_gen_low_len,
+                    (uint32_t) cv, 4);
+      } else {
+        result = queryTrie(m_gcat_gen_high, m_gcat_gen_high_len,
+                    (uint32_t) (cv & 0xffff), 4);
+      }
+      
+      /* If general character table didn't get a result, our last
+       * attempt is to use the hardcoded remainder table */
+      if (result == 0xffff) {
+        /* Reset result to Cn in case hardcoded tables don't work */
+        result = UNIKIT_GCAT_Cn;
+        
+        /* Check hardcoded tables (derived from the "remainder"
+         * invocation  of the unikit_db.pl script) */
+        if ((cv >= 0xd800) && (cv <= 0xdfff)) {
+          result = UNIKIT_GCAT_Cs;
+        
+        } else if ((cv >= 0xe000) && (cv <= 0xf8ff)) {
+          result = UNIKIT_GCAT_Co;
+        }
+      }
+      
+    } else {
+      raiseErr(__LINE__, NULL);
+    }
+    
+  } else if ((cv >= 0x20000) && (cv <= 0x10ffff)) {
+    /* Astral range, so make sure astral table is non-empty and has
+     * length divisible by four */
+    if ((m_gcat_astral_len < 1) || ((m_gcat_astral_len % 4) != 0)) {
+      raiseErr(__LINE__, "Invalid astral table length");
+    }
+    
+    /* Determine plane and offset of codepoint */
+    plane = (int) (cv >> 16);
+    offs = (cv & 0xffff);
+    
+    /* Search lower bound is zero and upper bound is maximum astral
+     * record index */
+    lbound = 0;
+    ubound = (m_gcat_astral_len / 4) - 1;
+    
+    /* Zoom in on the relevant record */
+    while (lbound < ubound) {
+      /* Midpoint record is halfway between, and at least one above
+       * lower bound */
+      mid = lbound + ((ubound - lbound) / 2);
+      if (mid <= lbound) {
+        mid = lbound + 1;
+      }
+      
+      /* Get key fields of midpoint record */
+      r_plane = m_gcat_astral[(mid * 4)    ];
+      r_lower = m_gcat_astral[(mid * 4) + 1];
+      
+      /* Compare query plane and offset to midpoint record plane */
+      if (plane < r_plane) {
+        cr = -1;
+        
+      } else if (plane > r_plane) {
+        cr = 1;
+        
+      } else if (plane == r_plane) {
+        if (offs < r_lower) {
+          cr = -1;
+          
+        } else if (offs > r_lower) {
+          cr = 1;
+          
+        } else if (offs == r_lower) {
+          cr = 0;
+          
+        } else {
+          raiseErr(__LINE__, NULL);
+        }
+        
+      } else {
+        raiseErr(__LINE__, NULL);
+      }
+      
+      /* Update boundaries depending on result of comparison */
+      if (cr < 0) {
+        /* Query is less than midpoint record, so new upper bound is one
+         * less than midpoint */
+        ubound = mid - 1;
+        
+      } else if (cr > 0) {
+        /* Query is greater than midpoint record, so new lower bound is
+         * the midpoint */
+        lbound = mid;
+        
+      } else if (cr == 0) {
+        /* Query exactly matches lower bound of record, so zoom in */
+        lbound = mid;
+        ubound = mid;
+        
+      } else {
+        raiseErr(__LINE__, NULL);
+      }
+    }
+    
+    /* lbound is the selected record, so get its key fields */
+    r_plane = m_gcat_astral[(lbound * 4)    ];
+    r_lower = m_gcat_astral[(lbound * 4) + 1];
+    r_upper = m_gcat_astral[(lbound * 4) + 2];
+    
+    /* If the requested codepoint is covered by this selected record,
+     * then query result is the category in the record; else, leave
+     * query result at Cn */
+    if ((plane == r_plane) && (offs >= r_lower) && (offs <= r_upper)) {
+      result = m_gcat_astral[(lbound * 4) + 3];
+    }
+  }
+  
+  /* Return result */
   return result;
 }
